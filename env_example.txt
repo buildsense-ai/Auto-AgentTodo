@@ -1,0 +1,19 @@
+# 模板插入服务配置文件示例
+# 请复制此文件内容到 .env 文件中并填写正确的配置值
+
+# OpenRouter API密钥（必需）
+# 从 https://openrouter.ai/ 获取您的API密钥
+OPENROUTER_API_KEY=your-openrouter-api-key-here
+
+# 可选配置项
+# 服务端口（默认: 8001）
+# PORT=8001
+
+# 输出目录（默认: generated_docs）
+# OUTPUT_DIR=generated_docs
+
+# 日志级别（默认: INFO）
+# LOG_LEVEL=INFO
+
+# AI模型（默认: google/gemini-2.5-pro-preview）
+# AI_MODEL=google/gemini-2.5-pro-preview 
