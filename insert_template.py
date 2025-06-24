@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 模板插入服务：AI智能合并原始文档与模板JSON
-FastAPI服务，提供insert_temp端口
 """
 
 import os
@@ -14,10 +13,8 @@ import tempfile
 from datetime import datetime
 from typing import Dict, Any, Optional, Union
 from pathlib import Path
+import argparse
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, validator
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
@@ -60,43 +57,10 @@ def get_api_key() -> str:
         raise RuntimeError("缺少必需的API密钥配置")
     return api_key
 
-# 创建FastAPI应用
-app = FastAPI(
-    title="模板插入服务",
-    description="AI智能合并原始文档与模板JSON，生成符合模板的docx文档",
-    version="1.0.0"
-)
-
 # 确保输出目录存在
 OUTPUT_DIR = "generated_docs"
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
-
-class InsertTemplateRequest(BaseModel):
-    """请求模型 - 文件路径方式（向后兼容）"""
-    template_json: Dict[str, str]
-    original_file_path: str
-    
-    @validator('template_json')
-    def validate_template_json(cls, v):
-        if not v or not isinstance(v, dict):
-            raise ValueError('template_json不能为空且必须是字典格式')
-        return v
-
-class InsertTemplateResponse(BaseModel):
-    """响应模型"""
-    final_doc_path: str
-    success: bool
-    message: str
-    processing_details: Optional[Dict[str, Any]] = None
-
-class ProcessingError(Exception):
-    """自定义处理异常"""
-    def __init__(self, message: str, error_code: str, status_code: int = 500):
-        self.message = message
-        self.error_code = error_code
-        self.status_code = status_code
-        super().__init__(self.message)
 
 class DocumentExtractor:
     """文档内容提取器"""
@@ -113,29 +77,6 @@ class DocumentExtractor:
                 404
             )
         return self._extract_content(file_path)
-    
-    def extract_from_upload_file(self, upload_file: UploadFile) -> str:
-        """从上传文件提取内容"""
-        try:
-            # 创建临时文件
-            suffix = Path(upload_file.filename or "temp").suffix
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-                temp_file.write(upload_file.file.read())
-                temp_path = temp_file.name
-            
-            try:
-                content = self._extract_content(temp_path)
-                return content
-            finally:
-                # 清理临时文件
-                os.unlink(temp_path)
-                
-        except Exception as e:
-            raise ProcessingError(
-                f"处理上传文件失败: {str(e)}",
-                "UPLOAD_PROCESSING_ERROR",
-                422
-            )
     
     def _extract_content(self, file_path: str) -> str:
         """提取文档内容的核心方法"""
@@ -511,224 +452,102 @@ class TemplateInserter:
             "generation_info": generation_info,
             "content_summary": {key: len(str(value)) for key, value in merged_content.items()}
         }
+
+def run_template_insertion(template_json_input: Union[str, Dict[str, str]], original_file_path: str) -> str:
+    """
+    AI tool to merge a document with a JSON template to generate a new docx file.
     
-    def process_from_upload_file(self, template_json: Dict[str, str], upload_file: UploadFile) -> Dict[str, Any]:
-        """从上传文件处理模板插入"""
-        logger.info(f"🚀 开始上传文件模式的模板插入处理: {upload_file.filename}")
-        
-        # 1. 提取原始文档内容
-        original_content = self.extractor.extract_from_upload_file(upload_file)
-        
-        # 2. AI智能合并
-        merged_content = self.merger.merge_content(template_json, original_content)
-        
-        # 3. 生成输出文件路径
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        # 使用上传文件名前缀
-        file_prefix = Path(upload_file.filename or "upload").stem
-        output_filename = f"merged_{file_prefix}_{timestamp}.docx"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-        
-        # 4. 生成docx文档
-        generation_info = self.generator.generate_docx(merged_content, output_path)
-        
-        logger.info(f"✅ 模板插入处理完成: {output_path}")
-        return {
-            "final_doc_path": output_path,
-            "generation_info": generation_info,
-            "content_summary": {key: len(str(value)) for key, value in merged_content.items()},
-            "original_filename": upload_file.filename
-        }
+    It uses an AI model to intelligently merge content from the original document 
+    (e.g., .docx, .pdf, .txt) into the structure defined by the JSON template.
 
-# 全局处理器实例
-template_inserter = None
+    Args:
+        template_json_input: A dictionary or file path for the template JSON.
+        original_file_path: The path to the original document file.
 
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时初始化"""
-    global template_inserter
+    Returns:
+        The file path of the generated .docx document.
+    """
+    logger.info("🚀 Starting template insertion process...")
     
     try:
+        # Load template json if a path is provided
+        if isinstance(template_json_input, str):
+            if not os.path.exists(template_json_input):
+                raise FileNotFoundError(f"Template JSON file not found: {template_json_input}")
+            with open(template_json_input, 'r', encoding='utf-8') as f:
+                template_json = json.load(f)
+        else:
+            template_json = template_json_input
+
+        # Get API key and initialize inserter
         api_key = get_api_key()
-        template_inserter = TemplateInserter(api_key)
-        logger.info("🚀 模板插入服务启动完成")
-    except Exception as e:
-        logger.error(f"❌ 服务启动失败: {e}")
-        raise
+        inserter = TemplateInserter(api_key)
 
-@app.post("/insert_temp", response_model=InsertTemplateResponse)
-async def insert_template_endpoint(request: InsertTemplateRequest):
-    """
-    模板插入端点 - 文件路径方式（向后兼容）
-    
-    将原始文档内容与模板JSON进行AI智能合并，生成符合模板的docx文档
-    """
-    logger.info("📥 接收到模板插入请求（文件路径模式）")
-    logger.info(f"   模板章节数: {len(request.template_json)}")
-    logger.info(f"   原始文档: {request.original_file_path}")
-    
-    try:
-        if template_inserter is None:
-            raise HTTPException(status_code=500, detail="服务未正确初始化")
+        # Process and get result
+        result = inserter.process_from_file_path(template_json, original_file_path)
         
-        # 处理模板插入
-        result = template_inserter.process_from_file_path(
-            template_json=request.template_json,
-            original_file_path=request.original_file_path
-        )
+        final_doc_path = result["final_doc_path"]
+        logger.info(f"✅ Template insertion process completed successfully. Document saved at: {final_doc_path}")
         
-        return InsertTemplateResponse(
-            final_doc_path=result["final_doc_path"],
-            success=True,
-            message="模板插入成功完成",
-            processing_details=result
-        )
-        
-    except ProcessingError as e:
-        logger.error(f"❌ 处理错误: {e.message}")
-        raise HTTPException(status_code=e.status_code, detail=e.message)
-    except HTTPException:
+        return final_doc_path
+
+    except (ProcessingError, FileNotFoundError) as e:
+        logger.error(f"❌ Processing failed: {e}")
         raise
     except Exception as e:
-        logger.error(f"❌ 模板插入处理失败: {e}")
+        logger.error(f"❌ An unexpected error occurred during template insertion: {e}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"内部处理失败: {str(e)}")
-
-@app.post("/insert_temp_upload", response_model=InsertTemplateResponse)
-async def insert_template_upload_endpoint(
-    template_json: str = Form(..., description="模板JSON字符串"),
-    file: UploadFile = File(..., description="原始文档文件")
-):
-    """
-    模板插入端点 - 文件上传方式（推荐）
-    
-    支持上传文件进行AI智能合并，更适合主AI接入和分布式部署
-    """
-    logger.info("📥 接收到模板插入请求（文件上传模式）")
-    logger.info(f"   上传文件: {file.filename}")
-    logger.info(f"   文件类型: {file.content_type}")
-    
-    try:
-        if template_inserter is None:
-            raise HTTPException(status_code=500, detail="服务未正确初始化")
-        
-        # 解析模板JSON
-        try:
-            template_json_dict = json.loads(template_json)
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"模板JSON格式错误: {str(e)}")
-        
-        # 验证模板JSON
-        if not template_json_dict or not isinstance(template_json_dict, dict):
-            raise HTTPException(status_code=400, detail="模板JSON不能为空且必须是字典格式")
-        
-        # 验证文件
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="未提供文件名")
-        
-        # 处理模板插入
-        result = template_inserter.process_from_upload_file(
-            template_json=template_json_dict,
-            upload_file=file
-        )
-        
-        return InsertTemplateResponse(
-            final_doc_path=result["final_doc_path"],
-            success=True,
-            message="模板插入成功完成",
-            processing_details=result
-        )
-        
-    except ProcessingError as e:
-        logger.error(f"❌ 处理错误: {e.message}")
-        raise HTTPException(status_code=e.status_code, detail=e.message)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ 模板插入处理失败: {e}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"内部处理失败: {str(e)}")
-
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    """
-    文件下载端点
-    
-    允许下载生成的文档文件
-    """
-    file_path = os.path.join(OUTPUT_DIR, filename)
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="文件不存在")
-    
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    )
-
-@app.get("/health")
-async def health_check():
-    """健康检查端点"""
-    return {
-        "status": "healthy",
-        "service": "模板插入服务",
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/")
-async def root():
-    """根端点"""
-    return {
-        "message": "模板插入服务",
-        "version": "2.0.0",
-        "description": "AI智能合并原始文档与模板JSON，生成符合模板的docx文档",
-        "features": [
-            "模块化架构：Extractor + Merger + Generator",
-            "多种输入方式：文件路径 + 文件上传",
-            "精确异常处理：400/422/404/500",
-            "详细处理信息：生成统计和验证结果"
-        ],
-        "endpoints": {
-            "insert_temp": "POST /insert_temp - 模板插入处理（文件路径方式，向后兼容）",
-            "insert_temp_upload": "POST /insert_temp_upload - 模板插入处理（文件上传方式，推荐）",
-            "download": "GET /download/{filename} - 下载生成的文档",
-            "health": "GET /health - 健康检查"
-        },
-        "supported_formats": {
-            "input": [".docx", ".pdf", ".txt", ".md"],
-            "output": [".docx"]
-        },
-        "ai_model": "google/gemini-2.5-pro-preview"
-    }
+        raise ProcessingError(f"An unexpected error occurred: {str(e)}", "UNEXPECTED_ERROR", 500)
 
 if __name__ == "__main__":
-    import uvicorn
+    parser = argparse.ArgumentParser(
+        description="AI-powered document generation from a template.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("template_json_path", help="Path to the template JSON file.")
+    parser.add_argument("original_file_path", help="Path to the original document file (.docx, .pdf, .txt).")
+
+    print("=" * 70)
+    print("🤖 AI Document Template Inserter")
+    print("=" * 70)
     
     # 检查API密钥配置
     try:
         api_key = get_api_key()
-        logger.info(f"✅ API密钥配置正确 (长度: {len(api_key)} 字符)")
+        logger.info(f"✅ API key found (length: {len(api_key)}).")
     except Exception as e:
-        print(f"❌ 错误: {e}")
-        print("\n配置方法:")
-        print("1. 创建.env文件并添加:")
-        print("   OPENROUTER_API_KEY=your-api-key-here")
-        print("\n2. 或设置系统环境变量:")
-        print("   export OPENROUTER_API_KEY='your-api-key-here'")
+        logger.error(f"❌ Critical Error: {e}")
+        print("\nConfiguration Help:")
+        print("1. Create a file named .env in the same directory.")
+        print("2. Add this line to it: OPENROUTER_API_KEY=your-api-key-here")
+        print("\nAlternatively, set a system environment variable.")
         exit(1)
+
+    args = parser.parse_args()
+
+    print(f"\n▶️ Starting process with:")
+    print(f"   Template: {args.template_json_path}")
+    print(f"   Original Document: {args.original_file_path}")
+    print("-" * 70)
+
+    try:
+        output_file = run_template_insertion(
+            template_json_input=args.template_json_path,
+            original_file_path=args.original_file_path
+        )
+        print(f"\n✅ Success! Generated document saved at:")
+        print(f"   -> {output_file}")
+
+    except FileNotFoundError as e:
+        print(f"\n❌ Error: File not found.")
+        print(f"   Details: {e}")
+    except ProcessingError as e:
+        print(f"\n❌ Error during processing: {e.error_code}")
+        print(f"   Details: {e.message}")
+    except Exception as e:
+        print(f"\n❌ An unexpected error occurred.")
+        traceback.print_exc()
     
-    print("🚀 启动模板插入服务...")
-    print("📋 服务功能: AI智能合并原始文档与模板JSON")
-    print("🌐 访问地址: http://localhost:8001")
-    print("📖 API文档: http://localhost:8001/docs")
-    print("💡 配置方式: 从.env文件或环境变量读取API密钥")
-    print("=" * 50)
-    
-    uvicorn.run(
-        "insert_template:app",
-        host="0.0.0.0",
-        port=8001,
-        reload=True,
-        log_level="info"
-    ) 
+    print("=" * 70)
+    print("✅ Process finished.")
+    print("=" * 70) 

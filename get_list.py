@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 文档列表提取服务：从.doc或.docx文件提取文档项列表
-FastAPI服务，提供get_list端口用于Dashboard展示
 """
 
 import os
@@ -13,9 +12,9 @@ import tempfile
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+import json
+import argparse
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel
 from docx import Document
 import subprocess
 
@@ -36,32 +35,16 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 
-# 创建FastAPI应用
-app = FastAPI(
-    title="文档列表提取服务",
-    description="从.doc或.docx文件提取文档项列表，用于Dashboard展示",
-    version="1.0.0"
-)
-
-class GetListRequest(BaseModel):
-    """请求模型 - 文件路径方式"""
-    file_path: str
-
-class DocumentItem(BaseModel):
-    """文档项模型"""
-    id: str
-    title: str
-    level: int = 1
-    type: str = "heading"
-    parent_id: Optional[str] = None
-
-class GetListResponse(BaseModel):
-    """响应模型"""
-    items: List[DocumentItem]
-    total_count: int
-    success: bool
-    message: str
-    processing_details: Optional[Dict[str, Any]] = None
+class DocumentItem(dict):
+    """文档项模型 - 使用字典以简化"""
+    def __init__(self, id: str, title: str, level: int = 1, type: str = "heading", parent_id: Optional[str] = None):
+        super().__init__(
+            id=id,
+            title=title,
+            level=level,
+            type=type,
+            parent_id=parent_id
+        )
 
 class DocumentListExtractor:
     """文档列表提取器"""
@@ -79,46 +62,30 @@ class DocumentListExtractor:
     def extract_from_file_path(self, file_path: str) -> List[DocumentItem]:
         """从文件路径提取文档项列表"""
         if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail=f"文件不存在: {file_path}")
+            raise FileNotFoundError(f"文件不存在: {file_path}")
         
         file_ext = Path(file_path).suffix.lower()
         if file_ext == '.doc':
             docx_path = self._convert_doc_to_docx(file_path)
-            return self._extract_from_docx(docx_path)
+            items = self._extract_from_docx(docx_path)
+            # Clean up converted file
+            if docx_path and os.path.exists(docx_path) and '_converted' in docx_path:
+                os.remove(docx_path)
+            return items
         elif file_ext == '.docx':
             return self._extract_from_docx(file_path)
         else:
-            raise HTTPException(status_code=422, detail=f"不支持的文件格式: {file_ext}")
-    
-    def extract_from_upload_file(self, upload_file: UploadFile) -> List[DocumentItem]:
-        """从上传文件提取文档项列表"""
-        try:
-            suffix = Path(upload_file.filename or "temp").suffix
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-                temp_file.write(upload_file.file.read())
-                temp_path = temp_file.name
-            
-            try:
-                if suffix.lower() == '.doc':
-                    docx_path = self._convert_doc_to_docx(temp_path)
-                    return self._extract_from_docx(docx_path)
-                elif suffix.lower() == '.docx':
-                    return self._extract_from_docx(temp_path)
-                else:
-                    raise HTTPException(status_code=422, detail=f"不支持的文件格式: {suffix}")
-            finally:
-                os.unlink(temp_path)
-                
-        except Exception as e:
-            logger.error(f"❌ 处理上传文件失败: {e}")
-            raise HTTPException(status_code=500, detail=f"处理上传文件失败: {str(e)}")
+            raise ValueError(f"不支持的文件格式: {file_ext}")
     
     def _convert_doc_to_docx(self, doc_path: str) -> str:
         """将.doc文件转换为.docx文件"""
         logger.info("🔄 开始DOC到DOCX转换...")
         
-        docx_path = doc_path.replace('.doc', '_converted.docx')
-        
+        # Create a temporary path for the converted file
+        temp_dir = tempfile.gettempdir()
+        base_name = Path(doc_path).stem
+        docx_path = os.path.join(temp_dir, f"{base_name}_converted.docx")
+
         try:
             libreoffice_paths = [
                 '/Applications/LibreOffice.app/Contents/MacOS/soffice',
@@ -140,7 +107,7 @@ class DocumentListExtractor:
                     continue
             
             if not libreoffice_cmd:
-                raise HTTPException(status_code=500, detail="LibreOffice未安装或不可用")
+                raise RuntimeError("LibreOffice未安装或不可用")
             
             if os.path.exists(docx_path):
                 os.remove(docx_path)
@@ -149,27 +116,31 @@ class DocumentListExtractor:
                 libreoffice_cmd,
                 '--headless',
                 '--convert-to', 'docx',
-                '--outdir', os.path.dirname(doc_path),
+                '--outdir', os.path.dirname(docx_path),
                 doc_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             
             if result.returncode != 0:
-                raise HTTPException(status_code=500, detail=f"LibreOffice转换失败")
+                error_message = result.stderr or result.stdout
+                raise RuntimeError(f"LibreOffice转换失败: {error_message}")
             
-            expected_docx = doc_path.replace('.doc', '.docx')
-            if os.path.exists(expected_docx):
-                if expected_docx != docx_path:
-                    os.rename(expected_docx, docx_path)
+            # The output file will be in the same directory as the docx_path with .docx extension
+            expected_docx_name = f"{Path(doc_path).stem}.docx"
+            created_file_path = os.path.join(os.path.dirname(docx_path), expected_docx_name)
+
+            if os.path.exists(created_file_path):
+                # Move to the final desired path
+                os.rename(created_file_path, docx_path)
                 logger.info(f"✅ 转换成功: {docx_path}")
                 return docx_path
             else:
-                raise HTTPException(status_code=500, detail="转换后的文件未找到")
+                raise FileNotFoundError(f"转换后的文件未找到: {created_file_path}")
                 
         except Exception as e:
             logger.error(f"❌ 转换过程中出错: {e}")
-            raise HTTPException(status_code=500, detail=f"文件转换失败: {str(e)}")
+            raise RuntimeError(f"文件转换失败: {str(e)}")
     
     def _extract_from_docx(self, docx_path: str) -> List[DocumentItem]:
         """从docx文件提取文档项列表"""
@@ -199,7 +170,7 @@ class DocumentListExtractor:
             
         except Exception as e:
             logger.error(f"❌ 提取文档项失败: {e}")
-            raise HTTPException(status_code=500, detail=f"文档解析失败: {str(e)}")
+            raise RuntimeError(f"文档解析失败: {str(e)}")
     
     def _process_paragraph(self, para, counter: int) -> Optional[DocumentItem]:
         """处理段落，识别标题和重要内容"""
@@ -257,28 +228,25 @@ class DocumentListExtractor:
             if first_row_text and len(first_row_text) > 5:
                 table_title = first_row_text[:50] + "..." if len(first_row_text) > 50 else first_row_text
         
-        items.append(DocumentItem(
-            id=f"{counter + 1}",
-            title=table_title,
-            level=2,
-            type="table"
-        ))
-        counter += 1
-        
-        # 提取重要行
-        for row_idx, row in enumerate(table.rows[1:], 1):
-            row_text = " | ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
-            
+        items.append(
+            DocumentItem(
+                id=str(start_counter + len(items) + 1),
+                title=f"表格 {table_idx + 1}",
+                level=2,  # Example level for a table
+                type="table"
+            )
+        )
+        for row in table.rows:
+            row_text = " | ".join([cell.text.strip() for cell in row.cells])
             if self._is_important_table_row(row_text):
-                items.append(DocumentItem(
-                    id=f"{counter + 1}",
-                    title=row_text[:80] + "..." if len(row_text) > 80 else row_text,
-                    level=3,
-                    type="table_row",
-                    parent_id=f"{start_counter + 1}"
-                ))
-                counter += 1
-        
+                items.append(
+                    DocumentItem(
+                        id=str(start_counter + len(items) + 1),
+                        title=row_text,
+                        level=3,  # Example level for a row
+                        type="table_row"
+                    )
+                )
         return items
     
     def _extract_title_info(self, text: str) -> Optional[Dict[str, Any]]:
@@ -350,118 +318,74 @@ class DocumentListExtractor:
         
         return any(keyword in row_text for keyword in keywords)
 
-# 全局提取器实例
-extractor = DocumentListExtractor()
+def run_get_list(file_path: str) -> List[Dict[str, Any]]:
+    """
+    AI tool to extract a structured list of items from a document (.doc or .docx).
+    
+    This function analyzes the document's structure, identifying headings, paragraphs, 
+    and tables to create a hierarchical list of its contents.
 
-@app.post("/get_list", response_model=GetListResponse)
-async def get_list_endpoint(request: GetListRequest):
-    """文档列表提取端点 - 文件路径方式"""
-    logger.info("📥 接收到文档列表提取请求（文件路径模式）")
-    logger.info(f"   文件路径: {request.file_path}")
+    Args:
+        file_path: The path to the document file.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents an item in the document.
+    """
+    logger.info(f"🚀 Starting document list extraction for: {file_path}")
     
     try:
-        items = extractor.extract_from_file_path(request.file_path)
+        extractor = DocumentListExtractor()
+        items = extractor.extract_from_file_path(file_path)
         
-        return GetListResponse(
-            items=items,
-            total_count=len(items),
-            success=True,
-            message="文档列表提取成功",
-            processing_details={
-                "file_path": request.file_path,
-                "extraction_time": datetime.now().isoformat(),
-                "item_types": {item_type: len([i for i in items if i.type == item_type]) 
-                             for item_type in set(item.type for item in items)}
-            }
-        )
+        # Convert DocumentItem objects to plain dicts for the final output
+        result_list = [dict(item) for item in items]
         
-    except HTTPException:
+        logger.info(f"✅ Successfully extracted {len(result_list)} items from the document.")
+        return result_list
+
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        logger.error(f"❌ Processing failed: {e}")
         raise
     except Exception as e:
-        logger.error(f"❌ 文档列表提取失败: {e}")
-        raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
-
-@app.post("/get_list_upload", response_model=GetListResponse)
-async def get_list_upload_endpoint(file: UploadFile = File(...)):
-    """文档列表提取端点 - 文件上传方式（推荐）"""
-    logger.info("📥 接收到文档列表提取请求（文件上传模式）")
-    logger.info(f"   上传文件: {file.filename}")
-    
-    try:
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="未提供文件名")
-        
-        file_ext = Path(file.filename).suffix.lower()
-        if file_ext not in ['.doc', '.docx']:
-            raise HTTPException(status_code=422, detail=f"不支持的文件格式: {file_ext}")
-        
-        items = extractor.extract_from_upload_file(file)
-        
-        return GetListResponse(
-            items=items,
-            total_count=len(items),
-            success=True,
-            message="文档列表提取成功",
-            processing_details={
-                "original_filename": file.filename,
-                "extraction_time": datetime.now().isoformat(),
-                "item_types": {item_type: len([i for i in items if i.type == item_type]) 
-                             for item_type in set(item.type for item in items)}
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ 文档列表提取失败: {e}")
-        raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
-
-@app.get("/health")
-async def health_check():
-    """健康检查端点"""
-    return {
-        "status": "healthy",
-        "service": "文档列表提取服务",
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/")
-async def root():
-    """根端点"""
-    return {
-        "message": "文档列表提取服务",
-        "version": "1.0.0",
-        "description": "从.doc或.docx文件提取文档项列表，用于Dashboard展示",
-        "features": [
-            "支持.doc和.docx文件格式",
-            "智能识别标题层级关系",
-            "提取表格标题和重要行",
-            "保持文档结构和编号",
-            "支持文件路径和上传两种方式"
-        ],
-        "endpoints": {
-            "get_list": "POST /get_list - 文档列表提取（文件路径方式）",
-            "get_list_upload": "POST /get_list_upload - 文档列表提取（文件上传方式，推荐）",
-            "health": "GET /health - 健康检查"
-        },
-        "supported_formats": [".doc", ".docx"],
-        "output_format": "结构化JSON列表，包含id、title、level、type等字段"
-    }
+        logger.error(f"❌ An unexpected error occurred during list extraction: {e}")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"An unexpected error occurred: {str(e)}")
 
 if __name__ == "__main__":
-    import uvicorn
-    
-    print("🚀 启动文档列表提取服务...")
-    print("📋 服务功能: 从文档中提取项目列表用于Dashboard展示")
-    print("🌐 访问地址: http://localhost:8002")
-    print("📖 API文档: http://localhost:8002/docs")
-    print("📄 支持格式: .doc, .docx")
-    print("=" * 50)
-    
-    uvicorn.run(
-        "get_list:app",
-        host="0.0.0.0",
-        port=8002,
-        reload=True,
-        log_level="info"
-    ) 
+    parser = argparse.ArgumentParser(
+        description="Extract a structured list of items from a .doc or .docx file.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("file_path", help="Path to the document file.")
+    parser.add_argument("--output-json", help="Optional. Path to save the output as a JSON file.", default=None)
+
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("📄 Document List Extractor")
+    print("=" * 70)
+    print(f"▶️  Processing file: {args.file_path}")
+    print("-" * 70)
+
+    try:
+        extracted_items = run_get_list(args.file_path)
+        
+        print(f"✅ Success! Extracted {len(extracted_items)} items.")
+
+        if args.output_json:
+            with open(args.output_json, 'w', encoding='utf-8') as f:
+                json.dump(extracted_items, f, ensure_ascii=False, indent=2)
+            print(f"✅ Output saved to: {args.output_json}")
+        else:
+            print("\nExtracted Items:")
+            for item in extracted_items:
+                indent = "  " * (item.get('level', 1) - 1)
+                print(f"{indent}- {item.get('title')}")
+                
+    except Exception as e:
+        print(f"\n❌ An error occurred: {e}")
+        traceback.print_exc()
+
+    print("=" * 70)
+    print("✅ Process finished.")
+    print("=" * 70) 
