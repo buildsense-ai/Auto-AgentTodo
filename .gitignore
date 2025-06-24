@@ -1,25 +1,3 @@
-# Exclude all files by default
-*
-
-# Only include MCP-related files
-!mcp_server.py
-!run_mcp_server.py
-!test_mcp_server.py
-!MCP_SERVER_README.md
-!MIGRATION_TO_FASTMCP.md
-!requirements.txt
-
-# Keep original files for reference
-!get_list.py
-!insert_template.py
-
-# Keep git files
-!.gitignore
-!.git/
-
-# Keep directories needed for MCP files
-!*/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
