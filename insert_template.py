@@ -62,6 +62,14 @@ OUTPUT_DIR = "generated_docs"
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
+class ProcessingError(Exception):
+    """自定义处理异常"""
+    def __init__(self, message: str, error_code: str, status_code: int = 500):
+        self.message = message
+        self.error_code = error_code
+        self.status_code = status_code
+        super().__init__(self.message)
+
 class DocumentExtractor:
     """文档内容提取器"""
     

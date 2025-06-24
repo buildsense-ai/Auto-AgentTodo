@@ -9,11 +9,10 @@ import re
 import logging
 import traceback
 import tempfile
+import argparse
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
-import json
-import argparse
 
 from docx import Document
 import subprocess
@@ -35,16 +34,23 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 
-class DocumentItem(dict):
-    """文档项模型 - 使用字典以简化"""
+class DocumentItem:
+    """文档项模型"""
     def __init__(self, id: str, title: str, level: int = 1, type: str = "heading", parent_id: Optional[str] = None):
-        super().__init__(
-            id=id,
-            title=title,
-            level=level,
-            type=type,
-            parent_id=parent_id
-        )
+        self.id = id
+        self.title = title
+        self.level = level
+        self.type = type
+        self.parent_id = parent_id
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "level": self.level,
+            "type": self.type,
+            "parent_id": self.parent_id
+        }
 
 class DocumentListExtractor:
     """文档列表提取器"""
@@ -67,11 +73,7 @@ class DocumentListExtractor:
         file_ext = Path(file_path).suffix.lower()
         if file_ext == '.doc':
             docx_path = self._convert_doc_to_docx(file_path)
-            items = self._extract_from_docx(docx_path)
-            # Clean up converted file
-            if docx_path and os.path.exists(docx_path) and '_converted' in docx_path:
-                os.remove(docx_path)
-            return items
+            return self._extract_from_docx(docx_path)
         elif file_ext == '.docx':
             return self._extract_from_docx(file_path)
         else:
@@ -81,11 +83,8 @@ class DocumentListExtractor:
         """将.doc文件转换为.docx文件"""
         logger.info("🔄 开始DOC到DOCX转换...")
         
-        # Create a temporary path for the converted file
-        temp_dir = tempfile.gettempdir()
-        base_name = Path(doc_path).stem
-        docx_path = os.path.join(temp_dir, f"{base_name}_converted.docx")
-
+        docx_path = doc_path.replace('.doc', '_converted.docx')
+        
         try:
             libreoffice_paths = [
                 '/Applications/LibreOffice.app/Contents/MacOS/soffice',
@@ -116,27 +115,23 @@ class DocumentListExtractor:
                 libreoffice_cmd,
                 '--headless',
                 '--convert-to', 'docx',
-                '--outdir', os.path.dirname(docx_path),
+                '--outdir', os.path.dirname(doc_path),
                 doc_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             
             if result.returncode != 0:
-                error_message = result.stderr or result.stdout
-                raise RuntimeError(f"LibreOffice转换失败: {error_message}")
+                raise RuntimeError(f"LibreOffice转换失败")
             
-            # The output file will be in the same directory as the docx_path with .docx extension
-            expected_docx_name = f"{Path(doc_path).stem}.docx"
-            created_file_path = os.path.join(os.path.dirname(docx_path), expected_docx_name)
-
-            if os.path.exists(created_file_path):
-                # Move to the final desired path
-                os.rename(created_file_path, docx_path)
+            expected_docx = doc_path.replace('.doc', '.docx')
+            if os.path.exists(expected_docx):
+                if expected_docx != docx_path:
+                    os.rename(expected_docx, docx_path)
                 logger.info(f"✅ 转换成功: {docx_path}")
                 return docx_path
             else:
-                raise FileNotFoundError(f"转换后的文件未找到: {created_file_path}")
+                raise RuntimeError("转换后的文件未找到")
                 
         except Exception as e:
             logger.error(f"❌ 转换过程中出错: {e}")
@@ -169,223 +164,213 @@ class DocumentListExtractor:
             return items
             
         except Exception as e:
-            logger.error(f"❌ 提取文档项失败: {e}")
-            raise RuntimeError(f"文档解析失败: {str(e)}")
+            logger.error(f"❌ 从docx文件提取失败: {e}")
+            raise RuntimeError(f"文档内容提取失败: {str(e)}")
     
     def _process_paragraph(self, para, counter: int) -> Optional[DocumentItem]:
-        """处理段落，识别标题和重要内容"""
+        """处理段落，提取标题信息"""
         text = para.text.strip()
-        if not text or len(text) < 2:
-            return None
         
-        style_name = para.style.name if para.style else ""
-        is_heading = False
-        level = 1
-        
-        # 检查标题样式
-        if "Heading" in style_name or "标题" in style_name:
-            is_heading = True
-            level_match = re.search(r'(\d+)', style_name)
-            if level_match:
-                level = int(level_match.group(1))
-        
-        # 检查格式（加粗等）
-        if para.runs:
-            first_run = para.runs[0]
-            if first_run.bold:
-                is_heading = True
-        
-        # 通过文本模式识别编号标题
-        title_info = self._extract_title_info(text)
-        if title_info:
-            is_heading = True
-            level = title_info['level']
-            text = title_info['title']
-        
-        # 过滤不重要的内容
-        if not is_heading and len(text) < 5:
-            return None
-        
+        # 过滤页眉页脚等无关内容
         if self._is_header_footer(text):
             return None
         
-        return DocumentItem(
-            id=str(counter + 1),
-            title=text[:100],
-            level=level,
-            type="heading" if is_heading else "paragraph"
-        )
+        # 尝试匹配标题模式
+        title_info = self._extract_title_info(text)
+        if title_info:
+            return DocumentItem(
+                id=f"item_{counter}",
+                title=title_info['title'],
+                level=title_info['level'],
+                type="heading"
+            )
+        
+        # 如果是重要段落但不是标题，也包含进来
+        if len(text) > 10 and len(text) < 200:
+            return DocumentItem(
+                id=f"item_{counter}",
+                title=text,
+                level=3,
+                type="paragraph"
+            )
+        
+        return None
     
     def _process_table(self, table, start_counter: int, table_idx: int) -> List[DocumentItem]:
-        """处理表格，提取表格标题和重要行"""
+        """处理表格，提取重要行"""
         items = []
         counter = start_counter
         
-        table_title = f"表格 {table_idx + 1}"
+        for row_idx, row in enumerate(table.rows):
+            row_text = " | ".join([cell.text.strip() for cell in row.cells])
+            
+            if self._is_important_table_row(row_text):
+                items.append(DocumentItem(
+                    id=f"table_{table_idx}_row_{row_idx}",
+                    title=row_text,
+                    level=2,
+                    type="table_row",
+                    parent_id=f"table_{table_idx}"
+                ))
+                counter += 1
         
-        if table.rows and table.rows[0].cells:
-            first_row_text = " | ".join([cell.text.strip() for cell in table.rows[0].cells if cell.text.strip()])
-            if first_row_text and len(first_row_text) > 5:
-                table_title = first_row_text[:50] + "..." if len(first_row_text) > 50 else first_row_text
-        
-        items.append(
-            DocumentItem(
-                id=str(start_counter + len(items) + 1),
+        if items:
+            # 添加表格标题
+            table_title = DocumentItem(
+                id=f"table_{table_idx}",
                 title=f"表格 {table_idx + 1}",
-                level=2,  # Example level for a table
+                level=1,
                 type="table"
             )
-        )
-        for row in table.rows:
-            row_text = " | ".join([cell.text.strip() for cell in row.cells])
-            if self._is_important_table_row(row_text):
-                items.append(
-                    DocumentItem(
-                        id=str(start_counter + len(items) + 1),
-                        title=row_text,
-                        level=3,  # Example level for a row
-                        type="table_row"
-                    )
-                )
-        return items
+            return [table_title] + items
+        
+        return []
     
     def _extract_title_info(self, text: str) -> Optional[Dict[str, Any]]:
-        """提取标题信息（编号和级别）"""
+        """从文本中提取标题信息"""
         for pattern in self.heading_patterns:
-            match = re.match(pattern, text.strip())
+            match = re.match(pattern, text)
             if match:
-                groups = match.groups()
-                if len(groups) >= 2:
-                    number_part = groups[0]
-                    title_part = groups[1].strip()
-                    level = self._calculate_level(number_part)
-                    
-                    return {
-                        'number': number_part,
-                        'title': title_part,
-                        'level': level
-                    }
+                number_part = match.group(1)
+                title_part = match.group(2).strip()
+                level = self._calculate_level(number_part)
+                
+                return {
+                    'title': f"{number_part}. {title_part}",
+                    'level': level,
+                    'number': number_part
+                }
+        
         return None
     
     def _calculate_level(self, number_part: str) -> int:
         """根据编号计算层级"""
-        if '.' in number_part:
-            return len(number_part.split('.'))
-        
-        chinese_numbers = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十']
-        if any(cn in number_part for cn in chinese_numbers):
+        if re.match(r'^\d+$', number_part):
             return 1
-        
-        if number_part.isdigit():
-            num = int(number_part)
-            if num <= 10:
-                return 1
-            elif num <= 100:
-                return 2
-            else:
-                return 3
-        
-        return 1
+        elif re.match(r'^\d+\.\d+$', number_part):
+            return 2
+        elif re.match(r'^\d+\.\d+\.\d+$', number_part):
+            return 3
+        elif number_part in ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十']:
+            return 1
+        elif re.match(r'^[A-Za-z]$', number_part):
+            return 2
+        else:
+            return 2
     
     def _is_header_footer(self, text: str) -> bool:
         """判断是否为页眉页脚"""
-        patterns = [
+        header_footer_patterns = [
             r'第\s*\d+\s*页',
             r'共\s*\d+\s*页',
-            r'\d{4}[-/]\d{1,2}[-/]\d{1,2}',
-            r'^页\s*\d+',
-            r'^\s*\d+\s*$',
+            r'\d{4}年\d{1,2}月\d{1,2}日',
+            r'^页码',
+            r'^第.*章$',
         ]
         
-        for pattern in patterns:
+        for pattern in header_footer_patterns:
             if re.search(pattern, text):
                 return True
         
-        return len(text) < 3 or text.isdigit()
+        return len(text) < 5 or len(text) > 300
     
     def _is_important_table_row(self, row_text: str) -> bool:
         """判断表格行是否重要"""
-        if not row_text or len(row_text.strip()) < 5:
+        if not row_text.strip() or len(row_text) < 5:
             return False
         
-        keywords = [
-            '小计', '合计', '总计', '汇总',
-            '项目', '工程', '施工', '建设',
-            '标准', '规范', '要求', '规定',
-            '计划', '方案', '设计', '图纸',
-            '质量', '安全', '进度', '费用'
-        ]
+        # 过滤明显的表头或分隔行
+        if re.match(r'^[\s\-\|]+$', row_text):
+            return False
         
-        return any(keyword in row_text for keyword in keywords)
+        # 包含重要关键词的行
+        important_keywords = ['项目', '内容', '要求', '标准', '规范', '方案', '措施']
+        for keyword in important_keywords:
+            if keyword in row_text:
+                return True
+        
+        return len(row_text) > 10 and len(row_text) < 200
 
-def run_get_list(file_path: str) -> List[Dict[str, Any]]:
+def extract_document_list(file_path: str) -> List[Dict[str, Any]]:
     """
-    AI tool to extract a structured list of items from a document (.doc or .docx).
+    AI tool to extract a structured list of items from Word documents (.doc/.docx).
     
-    This function analyzes the document's structure, identifying headings, paragraphs, 
-    and tables to create a hierarchical list of its contents.
+    This function processes Word documents and extracts headings, paragraphs, and table
+    content to create a structured list suitable for dashboard display or further processing.
 
     Args:
-        file_path: The path to the document file.
+        file_path: Path to the Word document file (.doc or .docx)
 
     Returns:
-        A list of dictionaries, where each dictionary represents an item in the document.
+        A list of dictionaries containing document items with id, title, level, type, and parent_id
     """
-    logger.info(f"🚀 Starting document list extraction for: {file_path}")
+    logger.info(f"🚀 Starting document list extraction from: {file_path}")
     
     try:
         extractor = DocumentListExtractor()
         items = extractor.extract_from_file_path(file_path)
         
-        # Convert DocumentItem objects to plain dicts for the final output
-        result_list = [dict(item) for item in items]
+        # Convert DocumentItem objects to dictionaries
+        result = [item.to_dict() for item in items]
         
-        logger.info(f"✅ Successfully extracted {len(result_list)} items from the document.")
-        return result_list
-
-    except (FileNotFoundError, ValueError, RuntimeError) as e:
-        logger.error(f"❌ Processing failed: {e}")
+        logger.info(f"✅ Successfully extracted {len(result)} items from document")
+        return result
+        
+    except FileNotFoundError as e:
+        logger.error(f"❌ File not found: {e}")
+        raise
+    except ValueError as e:
+        logger.error(f"❌ Invalid file format: {e}")
         raise
     except Exception as e:
-        logger.error(f"❌ An unexpected error occurred during list extraction: {e}")
+        logger.error(f"❌ An unexpected error occurred during extraction: {e}")
         logger.error(traceback.format_exc())
-        raise RuntimeError(f"An unexpected error occurred: {str(e)}")
+        raise RuntimeError(f"Document extraction failed: {str(e)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extract a structured list of items from a .doc or .docx file.",
+        description="Extract structured list from Word documents.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("file_path", help="Path to the document file.")
-    parser.add_argument("--output-json", help="Optional. Path to save the output as a JSON file.", default=None)
+    parser.add_argument("file_path", help="Path to the Word document file (.doc or .docx)")
+
+    print("=" * 70)
+    print("📋 Document List Extractor")
+    print("=" * 70)
 
     args = parser.parse_args()
 
-    print("=" * 70)
-    print("📄 Document List Extractor")
-    print("=" * 70)
-    print(f"▶️  Processing file: {args.file_path}")
+    print(f"\n▶️ Processing document:")
+    print(f"   File: {args.file_path}")
     print("-" * 70)
 
     try:
-        extracted_items = run_get_list(args.file_path)
+        items = extract_document_list(args.file_path)
         
-        print(f"✅ Success! Extracted {len(extracted_items)} items.")
+        print(f"\n✅ Successfully extracted {len(items)} items:")
+        print("-" * 70)
+        
+        for i, item in enumerate(items, 1):
+            indent = "  " * (item['level'] - 1)
+            print(f"{i:2d}. {indent}[{item['type']}] {item['title']}")
+        
+        print(f"\n📊 Summary:")
+        print(f"   Total items: {len(items)}")
+        print(f"   Headings: {len([i for i in items if i['type'] == 'heading'])}")
+        print(f"   Paragraphs: {len([i for i in items if i['type'] == 'paragraph'])}")
+        print(f"   Tables: {len([i for i in items if i['type'] == 'table'])}")
+        print(f"   Table rows: {len([i for i in items if i['type'] == 'table_row'])}")
 
-        if args.output_json:
-            with open(args.output_json, 'w', encoding='utf-8') as f:
-                json.dump(extracted_items, f, ensure_ascii=False, indent=2)
-            print(f"✅ Output saved to: {args.output_json}")
-        else:
-            print("\nExtracted Items:")
-            for item in extracted_items:
-                indent = "  " * (item.get('level', 1) - 1)
-                print(f"{indent}- {item.get('title')}")
-                
+    except FileNotFoundError as e:
+        print(f"\n❌ Error: File not found.")
+        print(f"   Details: {e}")
+    except ValueError as e:
+        print(f"\n❌ Error: Invalid file format.")
+        print(f"   Details: {e}")
     except Exception as e:
-        print(f"\n❌ An error occurred: {e}")
+        print(f"\n❌ An unexpected error occurred.")
         traceback.print_exc()
-
+    
     print("=" * 70)
     print("✅ Process finished.")
     print("=" * 70) 
